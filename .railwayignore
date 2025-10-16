@@ -1,0 +1,11 @@
+# Railway ignore file
+# This prevents Railway from auto-detecting build systems
+
+# Ignore any auto-generated files
+node_modules/
+.next/
+dist/
+build/
+
+# Force use of nixpacks.toml
+railpack-plan.json

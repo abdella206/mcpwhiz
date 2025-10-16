@@ -1,0 +1,12 @@
+# Railway Configuration
+# This file tells Railway to use Nixpacks instead of Railpack
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "PATH=/opt/venv/bin:$PATH pnpm start"
+
+# Force Railway to use our custom nixpacks.toml
+[build.nixpacks]
+configFile = "nixpacks.toml"

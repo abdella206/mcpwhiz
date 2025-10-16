@@ -1,0 +1,32 @@
+# Railway Nixpacks configuration
+# This tells Railway to install both Node.js and Python
+
+[phases.setup]
+nixPkgs = [
+  "nodejs_20",
+  "python311",
+  "python311Packages.pip",
+  "python311Packages.virtualenv",
+  "coreutils",
+  "bash",
+  "findutils",
+  "gnused",
+  "gnugrep"
+]
+
+[phases.install]
+cmds = [
+  "/bin/mkdir -p /opt/venv/bin",
+  "/bin/ln -sf $(ls /nix/store/*/bin/python | head -1) /opt/venv/bin/python3 || true",
+  "/bin/ln -sf $(ls /nix/store/*/bin/pip | head -1) /opt/venv/bin/pip3 || true",
+  "python --version || python3 --version",
+  "pip --version || pip3 --version",
+  "pip install mcp httpx pydantic virtualenv --break-system-packages 2>/dev/null || pip3 install mcp httpx pydantic virtualenv --break-system-packages 2>/dev/null || pip install --user mcp httpx pydantic virtualenv || pip3 install --user mcp httpx pydantic virtualenv || true",
+  "pnpm install"
+]
+
+[phases.build]
+cmds = ["pnpm run build"]
+
+[start]
+cmd = "PATH=/opt/venv/bin:$PATH pnpm start"

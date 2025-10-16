@@ -1,0 +1,13 @@
+# Nixpacks ignore file
+# This prevents Nixpacks from auto-detecting conflicting packages
+
+# Ignore auto-detected Node.js versions
+nodejs_18
+nodejs_16
+nodejs_14
+
+# Ignore auto-detected pnpm versions
+pnpm-8_x
+pnpm-7_x
+
+# Only use what we explicitly specify in nixpacks.toml
