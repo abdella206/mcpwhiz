@@ -392,7 +392,7 @@ export function WizardContent({
               <span className="hidden sm:inline">Share Link</span>
             </Button>
             <Button variant="outline" size="sm" asChild className="p-2 sm:px-3">
-              <a href="https://github.com/your-org/mcp-server-builder" target="_blank" rel="noopener noreferrer">
+              <a href="https://github.com/abdella206/mcpwhiz" target="_blank" rel="noopener noreferrer">
                 <Github className="h-4 w-4 sm:mr-2" />
                 <span className="hidden sm:inline">GitHub</span>
               </a>
