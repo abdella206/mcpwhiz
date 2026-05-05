@@ -74,6 +74,7 @@ export interface DynamicCodePreviewProps {
   prompts: PromptData[]
   sessionManagement?: boolean
   isRemoteServer?: boolean
+  transportType?: 'streamable' | 'sse' | 'stdio'  // Transport type for remote servers
   onReset?: () => void
   // Custom code management
   customCode?: {
@@ -94,4 +95,5 @@ export interface GenerateServerCodeParams {
   prompts: PromptData[]
   sessionManagement?: boolean
   isRemoteServer?: boolean
+  transportType?: 'streamable' | 'sse' | 'stdio'  // Transport type for remote servers
 }

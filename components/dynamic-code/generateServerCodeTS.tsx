@@ -33,12 +33,16 @@ export function generateServerCodeTS({
   prompts,
   sessionManagement = false,
   isRemoteServer = true,
+  transportType,
 }: GenerateServerCodeParams): string {
   // Check if we have context-aware prompts to determine imports
   const hasContextAwarePrompts = prompts.some(prompt => prompt.prompt_type === "context_aware")
   const hasDynamicResources = resources.some(resource => resource.resource_type === "dynamic" || resource.resource_type === "context_aware")
-  
-  if (!isRemoteServer) {
+
+  // Determine effective transport type
+  const effectiveTransport = transportType || (isRemoteServer ? 'streamable' : 'stdio')
+
+  if (effectiveTransport === 'stdio') {
     // Local server (stdio) mode
     let code = `// ${serverName} MCP Server
 // This server implements the Model Context Protocol (MCP)
@@ -60,7 +64,7 @@ const server = new McpServer({
 
     // Add server setup for stdio mode
     code += generateServerSetup(resources, tools, prompts, "")
-    
+
     code += `
 // Create stdio transport and connect
 const transport = new StdioServerTransport();
@@ -70,7 +74,288 @@ await server.connect(transport);
     return code
   }
 
-  // Remote server (HTTP) mode
+  // SSE transport mode
+  if (effectiveTransport === 'sse') {
+    let code = `// ${serverName} MCP Server
+// This server implements the Model Context Protocol (MCP)
+// using SSEServerTransport for Server-Sent Events communication.
+
+import { createServer } from "node:http";
+import { URL } from "node:url";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import {
+  CallToolRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ListToolsRequestSchema,
+  ReadResourceRequestSchema,${prompts.length > 0 ? `
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,` : ''}
+} from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
+
+`
+
+    // Generate resource, tool, and prompt definitions
+    if (resources.length > 0) {
+      code += `// Resource definitions
+const resources = [
+${resources.map(r => `  {
+    uri: "${r.uri}",
+    name: "${r.name}",
+    description: "${r.description}",
+    mimeType: "${r.mime_type || 'text/plain'}"
+  }`).join(',\n')}
+];
+
+`
+    }
+
+    if (tools.length > 0) {
+      code += `// Tool definitions
+const tools = [
+${tools.map(t => `  {
+    name: "${t.name}",
+    description: "${t.description}",
+    inputSchema: {
+      type: "object",
+      properties: {${Object.entries(t.parameters || {}).map(([key, param]) => `
+        ${key}: {
+          type: "${param.type}",
+          description: "${param.description}"
+        }`).join(',')}
+      },
+      required: [${Object.entries(t.parameters || {}).filter(([, p]) => p.required).map(([k]) => `"${k}"`).join(', ')}]
+    }
+  }`).join(',\n')}
+];
+
+`
+    }
+
+    if (prompts.length > 0) {
+      code += `// Prompt definitions
+const prompts = [
+${prompts.map(p => `  {
+    name: "${p.name}",
+    description: "${p.description}",
+    arguments: [${Object.entries(p.arguments || {}).map(([key, arg]) => `
+      {
+        name: "${key}",
+        description: "${arg.description}",
+        required: ${arg.required}
+      }`).join(',')}
+    ]
+  }`).join(',\n')}
+];
+
+`
+    }
+
+    // Generate the server creation function
+    code += `function createMCPServer() {
+  const server = new Server(
+    {
+      name: "${serverName}",
+      version: "${serverVersion}"
+    },
+    {
+      capabilities: {${resources.length > 0 ? `
+        resources: {},` : ''}${tools.length > 0 ? `
+        tools: {},` : ''}${prompts.length > 0 ? `
+        prompts: {}` : ''}
+      }
+    }
+  );
+
+`
+
+    // Add request handlers
+    if (resources.length > 0) {
+      code += `  server.setRequestHandler(ListResourcesRequestSchema, async (_request) => ({
+    resources
+  }));
+
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const resource = resources.find(r => r.uri === request.params.uri);
+    if (!resource) {
+      throw new Error(\`Unknown resource: \${request.params.uri}\`);
+    }
+    return {
+      contents: [{
+        uri: resource.uri,
+        mimeType: resource.mimeType,
+        text: \`Content for \${resource.name}\`
+      }]
+    };
+  });
+
+`
+    }
+
+    if (tools.length > 0) {
+      code += `  server.setRequestHandler(ListToolsRequestSchema, async (_request) => ({
+    tools
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const tool = tools.find(t => t.name === request.params.name);
+    if (!tool) {
+      throw new Error(\`Unknown tool: \${request.params.name}\`);
+    }
+    // Tool implementation placeholder
+    return {
+      content: [{
+        type: "text",
+        text: \`Tool \${request.params.name} executed with args: \${JSON.stringify(request.params.arguments)}\`
+      }]
+    };
+  });
+
+`
+    }
+
+    if (prompts.length > 0) {
+      code += `  server.setRequestHandler(ListPromptsRequestSchema, async (_request) => ({
+    prompts
+  }));
+
+  server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+    const prompt = prompts.find(p => p.name === request.params.name);
+    if (!prompt) {
+      throw new Error(\`Unknown prompt: \${request.params.name}\`);
+    }
+    return {
+      messages: [{
+        role: "user",
+        content: {
+          type: "text",
+          text: \`Prompt \${prompt.name} with args: \${JSON.stringify(request.params.arguments)}\`
+        }
+      }]
+    };
+  });
+
+`
+    }
+
+    code += `  return server;
+}
+
+// Session record: { server, transport }
+const sessions = new Map();
+
+const ssePath = "/mcp";
+const postPath = "/mcp/messages";
+
+async function handleSseRequest(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  const server = createMCPServer();
+  const transport = new SSEServerTransport(postPath, res);
+  const sessionId = transport.sessionId;
+
+  sessions.set(sessionId, { server, transport });
+
+  transport.onclose = async () => {
+    sessions.delete(sessionId);
+    await server.close();
+  };
+
+  transport.onerror = (error) => {
+    console.error("SSE transport error", error);
+  };
+
+  try {
+    await server.connect(transport);
+  } catch (error) {
+    sessions.delete(sessionId);
+    console.error("Failed to start SSE session", error);
+    if (!res.headersSent) {
+      res.writeHead(500).end("Failed to establish SSE connection");
+    }
+  }
+}
+
+async function handlePostMessage(req, res, url) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "content-type");
+  const sessionId = url.searchParams.get("sessionId");
+
+  if (!sessionId) {
+    res.writeHead(400).end("Missing sessionId query parameter");
+    return;
+  }
+
+  const session = sessions.get(sessionId);
+
+  if (!session) {
+    res.writeHead(404).end("Unknown session");
+    return;
+  }
+
+  try {
+    await session.transport.handlePostMessage(req, res);
+  } catch (error) {
+    console.error("Failed to process message", error);
+    if (!res.headersSent) {
+      res.writeHead(500).end("Failed to process message");
+    }
+  }
+}
+
+const port = Number(process.env.PORT ?? 8000);
+
+const httpServer = createServer(async (req, res) => {
+  if (!req.url) {
+    res.writeHead(400).end("Missing URL");
+    return;
+  }
+
+  const url = new URL(req.url, \`http://\${req.headers.host ?? "localhost"}\`);
+
+  // Handle CORS preflight
+  if (req.method === "OPTIONS" && (url.pathname === ssePath || url.pathname === postPath)) {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "content-type"
+    });
+    res.end();
+    return;
+  }
+
+  // SSE connection endpoint
+  if (req.method === "GET" && url.pathname === ssePath) {
+    await handleSseRequest(res);
+    return;
+  }
+
+  // Message posting endpoint
+  if (req.method === "POST" && url.pathname === postPath) {
+    await handlePostMessage(req, res, url);
+    return;
+  }
+
+  res.writeHead(404).end("Not Found");
+});
+
+httpServer.on("clientError", (err, socket) => {
+  console.error("HTTP client error", err);
+  socket.end("HTTP/1.1 400 Bad Request\\r\\n\\r\\n");
+});
+
+httpServer.listen(port, () => {
+  console.log(\`${serverName} MCP server (SSE) listening on http://localhost:\${port}\`);
+  console.log(\`  SSE stream: GET http://localhost:\${port}\${ssePath}\`);
+  console.log(\`  Message endpoint: POST http://localhost:\${port}\${postPath}?sessionId=...\`);
+});
+`
+
+    return code
+  }
+
+  // Remote server (Streamable HTTP) mode
   let code = `// ${serverName} MCP Server
 // This Express.js server implements the Model Context Protocol (MCP)
 // using StreamableHTTPServerTransport${sessionManagement ? ' with session management' : ' in stateless mode'}.
@@ -137,7 +422,7 @@ app.post('/mcp', async (req, res) => {
 `
     }
     code += generateServerSetup(resources, tools, prompts, "    ")
-    
+
     code += `
     // Connect to the MCP server
     await server.connect(transport);
@@ -191,10 +476,10 @@ app.listen(PORT, '0.0.0.0', () => {
   });
 
 `
-    
+
     // Add server setup for stateless mode
     code += generateServerSetup(resources, tools, prompts, "  ")
-    
+
     code += `  
 
 app.post('/mcp', async (req: express.Request, res: express.Response) => {
@@ -272,50 +557,50 @@ setupServer().catch((error: Error) => {
 // Helper function to generate server setup code
 function generateServerSetup(resources: ExtendedResourceData[], tools: ToolData[], prompts: ExtendedPromptData[], indent: string): string {
   let setupCode = ''
-  
+
   // Add resources if there are any
   if (resources.length > 0) {
     setupCode += `${indent}// Set up resources
 ${resources.map(resource => {
-  const resourceName = resource.name.toLowerCase().replace(/\s+/g, '-')
-  
-  if (resource.resource_type === 'context_aware' && (resource as ExtendedResourceData).completion_config) {
-    // Context-aware resource with ResourceTemplate and completion logic
-    const paramKeys = Object.keys(resource.parameters || {})
-    const paramDestructuring = paramKeys.length > 0 ? `{ ${paramKeys.join(', ')} }` : '{}'
-    const completionConfig = (resource as ExtendedResourceData).completion_config?.complete || {}
-    
-    // Generate completion functions
-    const completionEntries = Object.entries(completionConfig).map(([key, completion]: [string, CompletionConfig]) => {
-      if (completion.type === "conditional" && completion.conditions) {
-        const conditionsCode = completion.conditions.map((condition: {
-          when: Record<string, string>
-          values: string[]
-        }, index: number) => {
-          const whenConditions = Object.entries(condition.when).map(([whenKey, whenValue]) => 
-            `context?.arguments?.["${whenKey}"] === "${whenValue}"`
-          ).join(' && ')
-          
-          const valuesArray = condition.values.map((v: string) => `"${v}"`).join(', ')
-          const prefix = index === 0 ? 'if' : 'else if'
-          return `${prefix} (${whenConditions}) {
+      const resourceName = resource.name.toLowerCase().replace(/\s+/g, '-')
+
+      if (resource.resource_type === 'context_aware' && (resource as ExtendedResourceData).completion_config) {
+        // Context-aware resource with ResourceTemplate and completion logic
+        const paramKeys = Object.keys(resource.parameters || {})
+        const paramDestructuring = paramKeys.length > 0 ? `{ ${paramKeys.join(', ')} }` : '{}'
+        const completionConfig = (resource as ExtendedResourceData).completion_config?.complete || {}
+
+        // Generate completion functions
+        const completionEntries = Object.entries(completionConfig).map(([key, completion]: [string, CompletionConfig]) => {
+          if (completion.type === "conditional" && completion.conditions) {
+            const conditionsCode = completion.conditions.map((condition: {
+              when: Record<string, string>
+              values: string[]
+            }, index: number) => {
+              const whenConditions = Object.entries(condition.when).map(([whenKey, whenValue]) =>
+                `context?.arguments?.["${whenKey}"] === "${whenValue}"`
+              ).join(' && ')
+
+              const valuesArray = condition.values.map((v: string) => `"${v}"`).join(', ')
+              const prefix = index === 0 ? 'if' : 'else if'
+              return `${prefix} (${whenConditions}) {
           return [${valuesArray}].filter(r => r.startsWith(value));
         }`
-        }).join(' ')
-        
-        const defaultValues = completion.default ? 
-          `[${completion.default.map((v: string) => `"${v}"`).join(', ')}]` : 
-          '["default-repo"]'
-        
-        return `      ${key}: (value, context) => {
+            }).join(' ')
+
+            const defaultValues = completion.default ?
+              `[${completion.default.map((v: string) => `"${v}"`).join(', ')}]` :
+              '["default-repo"]'
+
+            return `      ${key}: (value, context) => {
         ${conditionsCode}
         return ${defaultValues}.filter(r => r.startsWith(value));
       }`
-      }
-      return `      ${key}: (value) => [].filter(r => r.startsWith(value))`
-    }).join(',\n')
-    
-    return `${indent}server.registerResource(
+          }
+          return `      ${key}: (value) => [].filter(r => r.startsWith(value))`
+        }).join(',\n')
+
+        return `${indent}server.registerResource(
 ${indent}  "${resourceName}",
 ${indent}  new ResourceTemplate("${resource.uri}", {
 ${indent}    list: undefined,
@@ -335,12 +620,12 @@ ${indent}      text: \`${(resource as ExtendedResourceData).static_content ? (re
 ${indent}    }]
 ${indent}  })
 ${indent});`
-  } else if (resource.resource_type === 'dynamic' && resource.parameters) {
-    // Dynamic resource with ResourceTemplate
-    const paramKeys = Object.keys(resource.parameters || {})
-    const paramDestructuring = paramKeys.length > 0 ? `{ ${paramKeys.join(', ')} }` : '{}'
-    
-    return `${indent}server.registerResource(
+      } else if (resource.resource_type === 'dynamic' && resource.parameters) {
+        // Dynamic resource with ResourceTemplate
+        const paramKeys = Object.keys(resource.parameters || {})
+        const paramDestructuring = paramKeys.length > 0 ? `{ ${paramKeys.join(', ')} }` : '{}'
+
+        return `${indent}server.registerResource(
 ${indent}  "${resourceName}",
 ${indent}  new ResourceTemplate("${resource.uri}", { list: undefined }),
 ${indent}  {
@@ -372,9 +657,9 @@ ${indent}      }]
 ${indent}    };`}
 ${indent}  }
 ${indent});`
-  } else {
-    // Static resource
-    return `${indent}server.registerResource(
+      } else {
+        // Static resource
+        return `${indent}server.registerResource(
 ${indent}  "${resourceName}",
 ${indent}  "${resource.uri}",
 ${indent}  {
@@ -385,15 +670,15 @@ ${indent}  },
 ${indent}  async (uri) => ({
 ${indent}    contents: [{
 ${indent}      uri: uri.href,
-${indent}      ${resource.resource_type === 'static' && resource.static_content 
-        ? `text: \`${resource.static_content.replace(/\n/g, '\\n').replace(/"/g, '\\"')}\``
-        : `text: "Sample content for ${resource.name}"`
-      }
+${indent}      ${resource.resource_type === 'static' && resource.static_content
+            ? `text: \`${resource.static_content.replace(/\n/g, '\\n').replace(/"/g, '\\"')}\``
+            : `text: "Sample content for ${resource.name}"`
+          }
 ${indent}    }]
 ${indent}  })
 ${indent});`
-  }
-}).join('\n\n')}
+      }
+    }).join('\n\n')}
 
 `}
 
@@ -409,7 +694,7 @@ ${indent}    inputSchema: {${Object.entries(tool.parameters).map(([key, param]: 
 ${indent}  },
 ${indent}  async (${tool.parameters && Object.keys(tool.parameters).length > 0 ? `{ ${Object.keys(tool.parameters).join(', ')} }` : 'args'}) => {
 ${indent}    ${tool.tool_type === 'static' && tool.static_result
-      ? (() => {
+        ? (() => {
           // Generate actual calculation logic for static tools
           if (tool.name.toLowerCase().includes('bmi') || tool.description.toLowerCase().includes('body mass')) {
             const params = Object.keys(tool.parameters || {})
@@ -431,8 +716,8 @@ ${indent}      }]
 ${indent}    };`
           }
         })()
-      : tool.tool_type === 'api' && tool.api_url
-        ? `const response = await fetch(\`${tool.api_url.replace(/\{(\w+)\}/g, '${$1}')}\`${tool.http_method && tool.http_method !== 'GET' ? `, {
+        : tool.tool_type === 'api' && tool.api_url
+          ? `const response = await fetch(\`${tool.api_url.replace(/\{(\w+)\}/g, '${$1}')}\`${tool.http_method && tool.http_method !== 'GET' ? `, {
 ${indent}      method: "${tool.http_method}",
 ${indent}      headers: ${tool.headers ? JSON.stringify(tool.headers) : '{}'}
 ${indent}    }` : tool.headers ? `, {
@@ -442,8 +727,8 @@ ${indent}    const data = await response.text();
 ${indent}    return {
 ${indent}      content: [{ type: "text", text: data }]
 ${indent}    };`
-        : tool.tool_type === 'resource_link' && tool.resource_links
-          ? `return {
+          : tool.tool_type === 'resource_link' && tool.resource_links
+            ? `return {
 ${indent}      content: [
 ${indent}        { type: "text", text: \`${tool.resource_links_header ? tool.resource_links_header.replace(/\{(\w+)\}/g, '${$1}') : `Found files matching "${Object.keys(tool.parameters || {}).length > 0 ? Object.keys(tool.parameters || {})[0] : 'pattern'}"`}\` },
 ${indent}        // ResourceLinks let tools return references without file content
@@ -456,7 +741,7 @@ ${indent}          description: '${link.description}'
 ${indent}        }`).join(',\n')}
 ${indent}      ]
 ${indent}    };`
-          : `return {
+            : `return {
 ${indent}      content: [
 ${indent}        {
 ${indent}          type: "text",
@@ -464,7 +749,7 @@ ${indent}          text: \`Tool ${tool.name} executed with args: \${JSON.stringi
 ${indent}        },
 ${indent}      ],
 ${indent}    };`
-    }
+      }
 ${indent}  }
 ${indent});`).join('\n\n')}
 
@@ -474,63 +759,63 @@ ${indent});`).join('\n\n')}
   if (prompts.length > 0) {
     setupCode += `${indent}// Set up prompts
 ${prompts.map(prompt => {
-  const isContextAware = prompt.prompt_type === "context_aware"
-  
-  if (isContextAware && prompt.completion_config?.complete) {
-    // Generate context-aware prompt with completable functions
-    const completionConfig = prompt.completion_config.complete
-    
-    // Generate argsSchema with completable functions
-    const argsSchemaEntries = Object.entries(prompt.arguments || {}).map(([key, arg]: [string, ArgumentDefinition]) => {
-      const completion = completionConfig[key]
-      
-      if (completion) {
-        if (completion.type === "static" && completion.values) {
-          // Static completion
-          const valuesArray = completion.values.map((v: string) => `"${v}"`).join(', ')
-          return `${indent}    ${key}: completable(z.${arg.type}(), (value) => {
+      const isContextAware = prompt.prompt_type === "context_aware"
+
+      if (isContextAware && prompt.completion_config?.complete) {
+        // Generate context-aware prompt with completable functions
+        const completionConfig = prompt.completion_config.complete
+
+        // Generate argsSchema with completable functions
+        const argsSchemaEntries = Object.entries(prompt.arguments || {}).map(([key, arg]: [string, ArgumentDefinition]) => {
+          const completion = completionConfig[key]
+
+          if (completion) {
+            if (completion.type === "static" && completion.values) {
+              // Static completion
+              const valuesArray = completion.values.map((v: string) => `"${v}"`).join(', ')
+              return `${indent}    ${key}: completable(z.${arg.type}(), (value) => {
 ${indent}      // ${arg.description}
 ${indent}      return [${valuesArray}].filter(d => d.startsWith(value));
 ${indent}    })`
-        } else if (completion.type === "conditional" && completion.conditions) {
-          // Conditional completion
-          const conditionsCode = completion.conditions.map((condition: {
-          when: Record<string, string>
-          values: string[]
-        }, index: number) => {
-            const whenConditions = Object.entries(condition.when).map(([whenKey, whenValue]) => 
-              `${whenKey} === "${whenValue}"`
-            ).join(' && ')
-            
-            const valuesArray = condition.values.map((v: string) => `"${v}"`).join(', ')
-            const prefix = index === 0 ? 'if' : 'else if'
-            return `${prefix} (${whenConditions}) {
+            } else if (completion.type === "conditional" && completion.conditions) {
+              // Conditional completion
+              const conditionsCode = completion.conditions.map((condition: {
+                when: Record<string, string>
+                values: string[]
+              }, index: number) => {
+                const whenConditions = Object.entries(condition.when).map(([whenKey, whenValue]) =>
+                  `${whenKey} === "${whenValue}"`
+                ).join(' && ')
+
+                const valuesArray = condition.values.map((v: string) => `"${v}"`).join(', ')
+                const prefix = index === 0 ? 'if' : 'else if'
+                return `${prefix} (${whenConditions}) {
 ${indent}        return [${valuesArray}].filter(n => n.startsWith(value));
 ${indent}      }`
-          }).join(' ')
-          
-          const defaultValues = completion.default ? 
-            `[${completion.default.map((v: string) => `"${v}"`).join(', ')}]` : 
-            '["Guest", "Visitor"]'
-          
-          return `${indent}    ${key}: completable(z.${arg.type}(), (value, context) => {
+              }).join(' ')
+
+              const defaultValues = completion.default ?
+                `[${completion.default.map((v: string) => `"${v}"`).join(', ')}]` :
+                '["Guest", "Visitor"]'
+
+              return `${indent}    ${key}: completable(z.${arg.type}(), (value, context) => {
 ${indent}      // ${arg.description}
 ${indent}      const ${Object.keys(completion.conditions[0].when)[0]} = context?.arguments?.["${Object.keys(completion.conditions[0].when)[0]}"];
 ${indent}      ${conditionsCode}
 ${indent}      return ${defaultValues}.filter(n => n.startsWith(value));
 ${indent}    })`
-        }
-      }
-      
-      // Fallback to regular z schema if no completion config
-      return `${indent}    ${key}: z.${arg.type}()${arg.required ? '' : '.optional()'}.describe("${arg.description}")`
-    })
-    
-    // Determine parameter destructuring for the prompt function
-    const paramKeys = Object.keys(prompt.arguments || {})
-    const paramDestructuring = paramKeys.length > 0 ? `{ ${paramKeys.join(', ')} }` : 'args'
-    
-    return `${indent}server.registerPrompt(
+            }
+          }
+
+          // Fallback to regular z schema if no completion config
+          return `${indent}    ${key}: z.${arg.type}()${arg.required ? '' : '.optional()'}.describe("${arg.description}")`
+        })
+
+        // Determine parameter destructuring for the prompt function
+        const paramKeys = Object.keys(prompt.arguments || {})
+        const paramDestructuring = paramKeys.length > 0 ? `{ ${paramKeys.join(', ')} }` : 'args'
+
+        return `${indent}server.registerPrompt(
 ${indent}  "${prompt.name}",
 ${indent}  {
 ${indent}    title: "${prompt.title || prompt.name}",
@@ -551,17 +836,17 @@ ${indent}      }
 ${indent}    ]
 ${indent}  })
 ${indent});`
-  } else {
-    // Generate basic prompt
-    const paramKeys = Object.keys(prompt.arguments || {})
-    const paramDestructuring = paramKeys.length > 0 ? `{ ${paramKeys.join(', ')} }` : 'args'
-    
-    // Generate simplified argsSchema
-    const argsSchemaEntries = Object.entries(prompt.arguments || {}).map(([key, arg]: [string, ArgumentDefinition]) => {
-      return `${key}: z.${arg.type}()${arg.required ? '' : '.optional()'}`
-    })
-    
-    return `${indent}server.registerPrompt(
+      } else {
+        // Generate basic prompt
+        const paramKeys = Object.keys(prompt.arguments || {})
+        const paramDestructuring = paramKeys.length > 0 ? `{ ${paramKeys.join(', ')} }` : 'args'
+
+        // Generate simplified argsSchema
+        const argsSchemaEntries = Object.entries(prompt.arguments || {}).map(([key, arg]: [string, ArgumentDefinition]) => {
+          return `${key}: z.${arg.type}()${arg.required ? '' : '.optional()'}`
+        })
+
+        return `${indent}server.registerPrompt(
 ${indent}  "${prompt.name}",
 ${indent}  {
 ${indent}    title: "${prompt.title || prompt.name}",
@@ -582,10 +867,10 @@ ${indent}      }
 ${indent}    ]
 ${indent}  })
 ${indent});`
-  }
-}).join('\n\n')}
+      }
+    }).join('\n\n')}
 
 `}
-  
+
   return setupCode
 }
